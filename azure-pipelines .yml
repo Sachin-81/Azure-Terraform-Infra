@@ -1,0 +1,210 @@
+trigger: none
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - 'NP/**'
+      - 'PR/**'
+
+variables:
+  TF_VERSION: "1.5.0"  # Set your Terraform version here
+  TF_SERVICE_CONNECTION: "XXX"  # Define the service connection as a variable
+
+stages:
+  - stage: SetUpEnvironment
+    displayName: "Set Up Environment1"
+    jobs:
+      - job: SetAzureVariables
+        displayName: "Set Azure Environment Variables"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          # Checkout the repository
+          - checkout: self
+            fetchDepth: 0
+          - script: |
+              echo "PR ID: $SYSTEM_PULLREQUEST_PULLREQUESTID"
+            displayName: "Debug PR ID"
+          - script: |
+              echo "Pipeline Trigger Reason: $(Build.Reason)"
+            displayName: "Print Pipeline Trigger Reason"
+
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: "$(TF_SERVICE_CONNECTION)"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "Setting up Azure environment variables for Terraform"
+                ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+                ARM_TENANT_ID=$(az account show --query tenantId -o tsv)
+                
+                echo "##vso[task.setvariable variable=ARM_SUBSCRIPTION_ID]$ARM_SUBSCRIPTION_ID"
+                echo "##vso[task.setvariable variable=ARM_TENANT_ID]$ARM_TENANT_ID"
+                
+                echo "Azure environment variables set successfully."
+            displayName: "Set Azure Environment Variables"
+           
+          - script: |
+              echo "Terraform working directory: $(TF_WORKING_DIR)"
+            displayName: "Print TF_WORKING_DIR Value"  # Debug step to verify variable  
+  - stage: IdentifyChanges
+    displayName: "Identify Changed Folders"
+    dependsOn: SetUpEnvironment
+    jobs:
+      - job: DetectChanges
+        displayName: "Detect Changes in Folders"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          # Checkout the repository
+          - checkout: self
+            fetchDepth: 0
+
+          - script: |
+              echo "Detecting changed files..."
+              CHANGED_FILES=$(git diff --name-only origin/main)
+              echo "Changed files: $CHANGED_FILES"
+              
+              if echo "$CHANGED_FILES" | grep -q '^NP/'; then
+                SUBSCRIPTION_DIR=$(echo "$CHANGED_FILES" | grep '^NP/' | cut -d'/' -f1-2 | head -n 1)
+              elif echo "$CHANGED_FILES" | grep -q '^PR/'; then
+                SUBSCRIPTION_DIR=$(echo "$CHANGED_FILES" | grep '^PR/' | cut -d'/' -f1-2 | head -n 1)
+              else
+                echo "No changes detected in subscription folders."
+                exit 1
+              fi
+              
+              echo "Subscription directory: $SUBSCRIPTION_DIR"
+              echo "##vso[task.setvariable variable=TF_WORKING_DIR;isOutput=true]$SUBSCRIPTION_DIR"
+              echo "##vso[task.setvariable variable=ARM_SUBSCRIPTION_ID;isOutput=true]$SUBSCRIPTION_ID"
+            displayName: "Identify Changed Subscription Folder"
+            name: tfdir
+
+  - stage: TerraformPlan
+    displayName: "Terraform Plan"
+    dependsOn: IdentifyChanges
+    variables:
+      # Reference the output variable from the previous stage
+      TF_WORKING_DIR1: $[ stageDependencies.IdentifyChanges.DetectChanges.outputs['tfdir.TF_WORKING_DIR'] ]
+
+    jobs:
+      - job: Plan
+        displayName: "Terraform Plan"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          # Checkout the repository
+          - checkout: self
+            fetchDepth: 0
+
+          - task: ms-devlabs.custom-terraform-tasks.custom-terraform-installer-task.TerraformInstaller@1
+            inputs:
+              terraformVersion: 'latest'
+            displayName: "Terraform Installation"
+          - script: |
+              echo "Terraform working directory: $(TF_WORKING_DIR1)"
+            displayName: "Print TF_WORKING_DIR Value"  # Debug step to verify variable  
+          - task: TerraformCLI@2
+            inputs:
+              command: 'init'
+              workingDirectory: '$(TF_WORKING_DIR1)'
+              allowTelemetryCollection: true
+            displayName: "Terraform Init"
+          - task: TerraformTaskV4@4
+            displayName: "Terraform Plan"
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: '$(TF_WORKING_DIR1)'
+              commandOptions: '-out main.tfplan'
+              environmentServiceNameAzureRM: 'az-tf-poc'
+              publishPlanResults: 'my-plan'
+          # Save the Terraform Plan output to a file and set as variable
+          - script: |
+              cd $(TF_WORKING_DIR1)
+              echo "Extracting Terraform plan output..."
+              PLAN_OUTPUT=$(terraform show -no-color main.tfplan)
+              echo "$PLAN_OUTPUT" > tfplan.txt
+              echo "##vso[task.setvariable variable=PLAN_OUTPUT;isOutput=true]$PLAN_OUTPUT"
+              echo "Terraform plan output saved successfully."
+            displayName: "Save Terraform Plan Output"
+            name: tfplan
+
+  - stage: PostPRComment
+    displayName: "Post PR Comment"
+    dependsOn: TerraformPlan
+    variables:
+      # Reference the output variable from the previous stage
+      TF_PLAN_POST: $[ stageDependencies.TerraformPlan.plan.outputs['tfplan.PLAN_OUTPUT'] ]
+      TF_WORKING_DIR2: $[ stageDependencies.IdentifyChanges.DetectChanges.outputs['tfdir.TF_WORKING_DIR'] ]
+
+    #condition: eq(variables['Build.Reason'], 'PullRequest')
+    jobs:
+      - job: PostComment
+        displayName: "Post Terraform Plan as PR Comment"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          # Checkout the repository
+          - checkout: self
+            fetchDepth: 0
+          - script: |
+              echo "Terraform working directory: $(TF_WORKING_DIR1)"
+              
+            displayName: "Print TF_WORKING_DIR Value"  # Debug step to verify variable   
+          - task: Bash@3
+            displayName: 'Terraform Plan to Azure DevOps'
+            inputs:
+              targetType: 'inline'
+              script: |
+                TF_PLAN=$(cat $TF_WORKING_DIR2/tfplan.txt)
+ 
+                ADO_API=$(echo "$(System.CollectionUri)$(System.TeamProject)/_apis/git/repositories/$(Build.Repository.Name)/pullRequests/$(System.PullRequest.PullRequestId)/threads?api-version=7.1-preview.1")
+ 
+                TF_PLAN_comment=$(jq --arg comment "$TF_PLAN_POST" '.comments[0].content = $comment' <<< '{"comments": [{"parentCommentId": 0,"content": "","commentType": 1}],"status": 1}')
+ 
+                curl --request POST "$ADO_API" \
+                --header "Authorization: Bearer $SYSTEM_ACCESSTOKEN" \
+                --header "Accept: application/json" \
+                --header "Content-Type: application/json" \
+                --data "$TF_PLAN_comment" \
+                --verbose
+            env:
+              workingDirectory: '$(System.DefaultWorkingDirectory)/terraform/'
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+          - script: |
+              echo "Posting plan output to PR..."
+              curl -H "Content-Type: application/json" \
+                   -H "Authorization: Bearer $(System.AccessToken)" \
+                   -X POST \
+                   -d "{\"body\": \"### Terraform Plan Output\\n\`\`\`\\n$(TF_PLAN_OUTPUT)\\n\`\`\`\"}" \
+                   "$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_apis/git/repositories/$(Build.Repository.Name)/pullRequests/$(System.PullRequest.PullRequestId)/threads?api-version=6.0"
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+            displayName: "Post Terraform Plan Output to Pull Request"
+
+  - stage: TerraformApply
+    displayName: "Terraform Apply"
+    dependsOn: PostPRComment
+    condition: eq(variables['Build.Reason'], 'PullRequestMerged')
+    jobs:
+      - job: Apply
+        displayName: "Terraform Apply"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          # Checkout the repository
+          - checkout: self
+            fetchDepth: 0
+
+          - task: TerraformTaskV4@4
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              workingDirectory: '$(TF_WORKING_DIR1)'
+              environmentServiceNameAzureRM: 'az-tf-poc'
+            displayName: "Terraform Apply"
